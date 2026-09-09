@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aver"
+# Single source of truth is aver/__init__.py; see [tool.hatch.version].
+dynamic = ["version"]
+description = "Record what your decisioning system saw and did."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "Aver" }]
+keywords = ["audit", "compliance", "decisioning", "lending", "model-governance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+# httpx and stdlib. This gets installed into a bank's Python environment
+# alongside whatever they already run; every extra dependency is a conversation
+# with their platform team.
+dependencies = ["httpx>=0.23"]
+
+[project.optional-dependencies]
+# Only needed for redact_mode="encrypt".
+encrypt = ["cryptography>=3.4"]
+dev = ["pytest>=7", "pytest-asyncio>=0.21", "cryptography>=3.4", "pyflakes"]
+
+[project.urls]
+Homepage = "https://github.com/aver-dev/aver-python"
+Source = "https://github.com/aver-dev/aver-python"
+
+[tool.hatch.version]
+path = "aver/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aver"]
+# PEP 561: the marker must reach the wheel, or downstream mypy silently ignores
+# every annotation in this package. force-include states it outright rather
+# than relying on it being swept up with the package directory.
+force-include = { "aver/py.typed" = "aver/py.typed" }
+
+[tool.hatch.build.targets.sdist]
+include = ["aver", "tests", "examples", "README.md", "LICENSE", "DESIGN.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# The test modules do `from conftest import FakeTransport`, which relies on
+# the rootdir being placed on sys.path. That is prepend mode's behaviour and
+# not importlib's, so pin it rather than inherit whatever the default becomes.
+addopts = "--import-mode=prepend"
+# Scoped to our own package: asyncio.to_thread and httpx internals emit
+# deprecations across the Python versions we claim to support, and failing CI
+# for those tells us nothing about this library.
+filterwarnings = ["error::DeprecationWarning:aver.*"]
