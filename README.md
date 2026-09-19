@@ -67,15 +67,19 @@ exhaustive.
 |---|---|
 | `schema_version` | Wire format version. Currently `"1"`. |
 | `idempotency_key` | UUID4 generated at enqueue and carried on the record itself, so a retry — or a redelivery in a differently-composed batch — cannot become a second ledger entry. |
-| `decision_id` | UUID4 identifying this decision. |
+| `decision_id` | UUID4 identifying this decision. Generated here and kept by the ledger, so the id `record()` returns to you is the one to store against your application row and the one `reconstruct` answers to. |
 | `parent_decision_id` | The prior step in a multi-step chain, or `null`. |
-| `stream_id` | The stream you configured. |
 | `session_id` | The identifier **you** passed — usually your application id. |
-| `inputs` | The `role` and `value` of each thing you passed to `observe()`, **after redaction**. |
+| `inputs` | The `role` and `data` of each thing you passed to `observe()`, **after redaction**. |
 | `model_version`, `model_artifact_hash`, `feature_set_version`, `rule_config_hash` | Whatever you passed to `model()`. Strings you supply. |
 | `policy_version` | The string you configured or passed. |
 | `action` | The dict you passed to `record_action()`, verbatim. If your block raised, this becomes `{"type": "error", ...}` and your action is preserved under `attempted_action`. |
 | `recorded_at` | UTC timestamp, taken when you recorded — not when we delivered. |
+
+`stream_id` is **not** on the record. It travels once per request, on the
+envelope: `POST /v1/decisions` with a body of
+`{"stream_id": ..., "records": [...]}`. That is the shape the service decodes,
+and `tests/test_wire_contract.py` holds it to it.
 
 **Every request also carries these HTTP headers:**
 
@@ -189,7 +193,7 @@ without Aver being able to read it. Recover a value with the key you hold:
 
 ```python
 from aver import decrypt_field
-pan = decrypt_field(record["inputs"][0]["value"]["applicant"]["pan"], key)
+pan = decrypt_field(record["inputs"][0]["data"]["applicant"]["pan"], key)
 ```
 
 Encryption needs one extra dependency, so it is opt-in:
@@ -231,12 +235,18 @@ except (AverBufferFull, AverClientClosed):
 
 ```python
 aver.stats()
-# {"queued": 12, "sent": 45231, "failed": 3, "dropped": 0,
+# {"queued": 12, "sent": 45231, "failed_batches": 3, "dropped": 0,
 #  "last_error": "connection timeout", "last_success_at": "2026-09-07T09:14:22Z"}
 ```
 
+`queued`, `sent` and `dropped` count **records**. `failed_batches` counts
+delivery **attempts** — one batch retried four times adds four — which is why
+it does not share their name.
+
 `dropped` should be zero. If it is not, records are missing from your audit
-trail. The `aver` logger reports the same events: INFO on start and stop,
+trail. `sent` counts only what reached the service: a record the transport
+could not serialise lands in `dropped`, never in `sent`, even when the rest of
+its batch was delivered. The `aver` logger reports the same events: INFO on start and stop,
 WARNING on retry, ERROR on any permanent drop.
 
 For tests and batch jobs, drain explicitly:
@@ -267,8 +277,8 @@ Nothing else changes, and no traffic goes anywhere else.
 aver.record(
     session_id=application_id,
     inputs=[
-        {"role": "application_form", "value": form_data},
-        {"role": "cibil_report", "value": bureau_response},
+        {"role": "application_form", "data": form_data},
+        {"role": "cibil_report", "data": bureau_response},
     ],
     model_version="scorecard-v7",
     model_artifact_hash="sha256:9f2b...",

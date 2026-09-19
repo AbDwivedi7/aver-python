@@ -1,0 +1,41 @@
+{
+  "stream_id": "consumer-pl",
+  "records": [
+    {
+      "schema_version": "1",
+      "idempotency_key": "11111111-1111-4111-8111-111111111111",
+      "decision_id": "22222222-2222-4222-8222-222222222222",
+      "parent_decision_id": null,
+      "session_id": "d71ddc40-3c57-4fc0-a9fc-d3ec6f3ffb25",
+      "inputs": [
+        {
+          "role": "cibil_report",
+          "data": {
+            "score": 742,
+            "applicant": {
+              "pan": "[REDACTED]"
+            }
+          }
+        },
+        {
+          "role": "application_form",
+          "data": {
+            "amount": 250000,
+            "tenor_months": 36
+          }
+        }
+      ],
+      "model_version": "scorecard-4.2",
+      "model_artifact_hash": "sha256:a1b2",
+      "feature_set_version": "fs-2024-11",
+      "rule_config_hash": "sha256:c3d4",
+      "policy_version": "policy-17",
+      "action": {
+        "decision": "approve",
+        "limit": 250000,
+        "customer_ref": "LN-2024-8817"
+      },
+      "recorded_at": "2026-09-18T09:14:22.031Z"
+    }
+  ]
+}

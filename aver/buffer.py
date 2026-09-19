@@ -77,7 +77,7 @@ class RecordBuffer:
         self._close_deadline = 0.0
 
         self._sent = 0
-        self._failed = 0
+        self._failed_batches = 0
         self._dropped = 0
         self._last_error: Optional[str] = None
         self._last_success_at: Optional[str] = None
@@ -172,7 +172,7 @@ class RecordBuffer:
             return {
                 "queued": len(self._q) + self._inflight,
                 "sent": self._sent,
-                "failed": self._failed,
+                "failed_batches": self._failed_batches,
                 "dropped": self._dropped,
                 "last_error": self._last_error,
                 "last_success_at": self._last_success_at,
@@ -223,40 +223,71 @@ class RecordBuffer:
         delay = INITIAL_BACKOFF
         while True:
             try:
-                self._transport.send(batch)
+                delivered = self._transport.send(batch)
+                if not isinstance(delivered, int):
+                    # A transport that does not report a count is broken, and
+                    # there is no safe default: assuming the whole batch landed
+                    # is how `sent` came to include records that never left the
+                    # process, which is the failure this return value exists to
+                    # prevent. Raised, so it lands in `dropped` and `last_error`
+                    # rather than passing as a delivery.
+                    raise TypeError(
+                        "transport.send must return the number of records "
+                        "delivered, got {0}".format(type(delivered).__name__)
+                    )
             except AverTransportError as exc:
                 retryable, hint, detail = exc.retryable, exc.retry_after, str(exc)
                 brief = exc.summary
+                written, sent_indices = exc.written, exc.sent_indices
             except Exception as exc:  # a transport bug must not kill the thread
                 retryable, hint = False, None
                 detail = "{0}: {1}".format(type(exc).__name__, exc)
                 brief = type(exc).__name__  # stats() gets the class, not the text
+                written, sent_indices = None, None
             else:
+                # A transport reports how many records it actually put on the
+                # wire, which is not always how many we handed it: one that
+                # cannot be serialised is dropped in there. Counting the batch
+                # instead of the delivery is what let `sent` include records
+                # that never left the process.
+                unsent = len(batch) - delivered
                 with self._cv:
-                    self._sent += len(batch)
+                    self._sent += delivered
+                    self._dropped += unsent
                     self._inflight -= len(batch)
-                    self._last_success_at = _utcnow()
+                    if unsent:
+                        self._last_error = "{0} record(s) not serialisable".format(
+                            unsent
+                        )
+                    # Stamped by a delivery, not by reaching this line. No
+                    # in-tree transport returns zero here — the real one raises
+                    # instead — but `last_success_at` is the field a platform
+                    # team watches for staleness, and it should mean what its
+                    # name says however it is reached.
+                    if delivered:
+                        self._last_success_at = _utcnow()
                     total, pending = self._sent, len(self._q)
                     self._cv.notify_all()
                 log.info(
                     "aver: flushed %d record(s) (total=%d, queued=%d)",
-                    len(batch),
+                    delivered,
                     total,
                     pending,
                 )
+                if unsent:
+                    log.error(
+                        "aver: %d record(s) in the batch could not be "
+                        "serialised and were dropped",
+                        unsent,
+                    )
                 return True
 
             with self._cv:
-                self._failed += 1
+                self._failed_batches += 1
                 self._last_error = brief  # never the response body — see errors.py
 
             if not retryable:
-                log.error(
-                    "aver: dropping %d record(s), permanent failure: %s",
-                    len(batch),
-                    detail,
-                )
-                self._discard(batch)
+                self._resolve_permanent(batch, written, sent_indices, detail)
                 return False
 
             wait = delay if hint is None else max(0.0, hint)
@@ -301,6 +332,84 @@ class RecordBuffer:
             self._inflight -= len(batch)
             self._dropped += len(batch)
             self._cv.notify_all()
+
+    def _resolve_permanent(
+        self,
+        batch: Sequence[Record],
+        written: Optional[int],
+        sent_indices: Optional[Sequence[int]],
+        detail: str,
+    ) -> None:
+        """Account for a batch the service permanently refused.
+
+        A rejection part-way through a batch is not all-or-nothing. Each record
+        commits in its own transaction, so the ones before the offending record
+        are on the ledger, the offending record can never be written, and the
+        ones behind it were not attempted at all. Discarding the batch counted
+        the written ones as lost *and* threw away the untried ones, which is
+        both halves of the number wrong.
+
+        Retrying the whole batch instead does not work either: the offending
+        record returns to the same position, is refused again, and the buffer
+        never makes progress. Dropping exactly one record per rejection is what
+        terminates — and it needs the response, which is why there is no
+        cheaper version of this.
+        """
+        if written is None or sent_indices is None:
+            # The service said nothing about what it wrote, so nothing was:
+            # a request refused before the batch was read, or a body we could
+            # not parse. The whole batch is gone.
+            log.error(
+                "aver: dropping %d record(s), permanent failure: %s",
+                len(batch),
+                detail,
+            )
+            self._discard(batch)
+            return
+
+        wire = [batch[i] for i in sent_indices]
+        # Clamp rather than trust: a count past the end would index a record
+        # that was never sent, and blame it for a rejection it had no part in.
+        written = max(0, min(written, len(wire)))
+        offender = wire[written:written + 1]
+        remainder = wire[written + 1:]
+        # Records the transport could not serialise never reached the wire.
+        unserialisable = len(batch) - len(wire)
+
+        with self._cv:
+            self._inflight -= len(batch)
+            self._sent += written
+            if written:
+                # Those records are on the ledger. The response was an error,
+                # but the audit trail did advance, and that is the question
+                # `last_success_at` answers.
+                self._last_success_at = _utcnow()
+            room = max(0, self._max - len(self._q))
+            keep = remainder[:room]
+            overflow = len(remainder) - len(keep)
+            for record in reversed(keep):
+                self._q.appendleft(record)
+            self._dropped += unserialisable + len(offender) + overflow
+            # `last_error` is already the caller's safe summary. `detail` can
+            # quote the response body, so it goes to the log below and no
+            # further — see errors.py.
+            self._cv.notify_all()
+
+        if offender:
+            log.error(
+                "aver: record %s was permanently refused and has been dropped "
+                "(%d already written, %d requeued): %s",
+                offender[0].get("decision_id"),
+                written,
+                len(keep),
+                detail,
+            )
+        if overflow:
+            log.error(
+                "aver: buffer full, dropped %d record(s) the service had not "
+                "yet seen",
+                overflow,
+            )
 
     def _drain(self) -> None:
         """Final pass at shutdown, bounded by the close deadline."""

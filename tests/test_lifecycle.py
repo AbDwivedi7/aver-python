@@ -255,7 +255,7 @@ class TestConfig:
         try:
             result = client.record(
                 session_id="app-1",
-                inputs=[{"role": "conn", "value": threading.Lock()}],
+                inputs=[{"role": "conn", "data": threading.Lock()}],
                 action={"type": "approve"},
             )
             assert result is None
@@ -285,7 +285,7 @@ class TestAsyncParity:
             assert await client.flush(timeout=2.0)
             record = transport.delivered_records()[0]
             assert record["session_id"] == "app-1"
-            assert record["inputs"][0]["value"]["applicant"]["pan"] == "[REDACTED]"
+            assert record["inputs"][0]["data"]["applicant"]["pan"] == "[REDACTED]"
             assert d.decision_id is not None
         finally:
             await client.close(timeout=0.5)

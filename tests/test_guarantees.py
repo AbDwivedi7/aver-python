@@ -36,7 +36,7 @@ class TestNeverBlocks:
         try:
             client.record(
                 session_id="app-1",
-                inputs=[{"role": "form", "value": {"a": 1}}],
+                inputs=[{"role": "form", "data": {"a": 1}}],
                 action={"type": "approve"},
             )
             # Let the flusher pick it up and get stuck in the 5s send.
@@ -45,7 +45,7 @@ class TestNeverBlocks:
             for i in range(100):
                 client.record(
                     session_id="app-{0}".format(i),
-                    inputs=[{"role": "form", "value": {"a": i}}],
+                    inputs=[{"role": "form", "data": {"a": i}}],
                     action={"type": "approve"},
                 )
             elapsed = time.perf_counter() - start
@@ -81,7 +81,7 @@ class TestNeverBlocks:
             start = time.perf_counter()
             client.record(
                 session_id="app-1",
-                inputs=[{"role": "cibil", "value": big}],
+                inputs=[{"role": "cibil", "data": big}],
                 action={"type": "approve"},
             )
             elapsed = time.perf_counter() - start
@@ -130,7 +130,7 @@ class TestNeverRaises:
             for i in range(5):
                 client.record(
                     session_id="app-{0}".format(i),
-                    inputs=[{"role": "form", "value": {"i": i}}],
+                    inputs=[{"role": "form", "data": {"i": i}}],
                     action={"type": "approve"},
                 )
                 with client.decision(session_id="ctx-{0}".format(i)) as d:
@@ -280,7 +280,7 @@ class TestIdempotency:
         try:
             client.record(
                 session_id="app-1",
-                inputs=[{"role": "form", "value": {"a": 1}}],
+                inputs=[{"role": "form", "data": {"a": 1}}],
                 action={"type": "approve"},
             )
             assert client.flush(timeout=3.0)
@@ -367,6 +367,148 @@ class TestIdempotency:
             client.close(timeout=0.5)
 
 
+class TestPartialRejection:
+    """A batch refused part-way is three groups, not one.
+
+    The service commits each record in its own transaction and reports what it
+    wrote. The records before the offending one are on the ledger, the
+    offending one can never be written, and the ones behind it were never
+    attempted. Discarding the batch got both halves of the number wrong;
+    requeuing it whole never terminates.
+    """
+
+    @staticmethod
+    def _rejects_after(written, sent_indices):
+        """Fail the first attempt the way a 400 mid-batch does."""
+
+        def behaviour(attempt):
+            if attempt == 1:
+                raise AverTransportError(
+                    "HTTP 400 (permanent): record 2 is invalid",
+                    retryable=False,
+                    status_code=400,
+                    written=written,
+                    sent_indices=sent_indices,
+                )
+
+        return behaviour
+
+    def test_written_records_are_kept_the_offender_dropped_the_rest_resumed(self):
+        transport = FakeTransport(self._rejects_after(2, (0, 1, 2, 3, 4)))
+        client = make_client(transport, batch_size=5, flush_interval=5.0)
+        try:
+            for i in range(5):
+                client.record(
+                    session_id="r{0}".format(i),
+                    inputs=[],
+                    action={"type": "approve"},
+                )
+            assert client.flush(timeout=3.0)
+        finally:
+            client.close(timeout=0.5)
+
+        stats = client.stats()
+        assert stats["sent"] == 4, "the two already written were counted as lost"
+        assert stats["dropped"] == 1, "only the refused record is gone"
+
+        # r0 and r1 are on the ledger and are not sent again; r2 was refused
+        # and dropped; delivery resumes at r3.
+        assert [r["session_id"] for r in transport.attempts[1].records] == ["r3", "r4"]
+
+    def test_the_written_ones_stamp_a_success_even_though_the_call_failed(self):
+        transport = FakeTransport(self._rejects_after(2, (0, 1, 2)))
+        client = make_client(transport, batch_size=3, flush_interval=5.0)
+        try:
+            for i in range(3):
+                client.record(
+                    session_id="r{0}".format(i), inputs=[], action={"type": "ok"}
+                )
+            assert client.flush(timeout=3.0)
+        finally:
+            client.close(timeout=0.5)
+        # The response was an error; the audit trail still advanced, which is
+        # the question last_success_at answers.
+        assert client.stats()["last_success_at"] is not None
+        assert client.stats()["sent"] == 2
+
+    def test_a_run_of_bad_records_terminates_one_per_attempt(self):
+        """Requeuing the batch whole would loop on the same record forever."""
+        attempts = []
+
+        def behaviour(attempt):
+            attempts.append(attempt)
+            if attempt <= 2:  # the first two records are each refused in turn
+                raise AverTransportError(
+                    "HTTP 400 (permanent)",
+                    retryable=False,
+                    status_code=400,
+                    written=0,
+                    sent_indices=tuple(range(4 - attempt)),
+                )
+
+        transport = FakeTransport(behaviour)
+        client = make_client(transport, batch_size=3, flush_interval=5.0)
+        try:
+            for i in range(3):
+                client.record(
+                    session_id="r{0}".format(i), inputs=[], action={"type": "ok"}
+                )
+            assert client.flush(timeout=3.0), "the buffer never drained"
+        finally:
+            client.close(timeout=0.5)
+
+        stats = client.stats()
+        assert stats["dropped"] == 2, "one record dropped per rejection, no more"
+        assert stats["sent"] == 1, "the survivor got through"
+        assert len(attempts) == 3, "made progress every attempt"
+
+    def test_a_gap_in_the_wire_indices_does_not_shift_the_blame(self):
+        """The count indexes the wire; index 1 of the wire is batch index 2.
+
+        Naive arithmetic drops r1 — which never reached the service — and keeps
+        r2, which it actually refused, so r2 comes back forever.
+
+        The gap is handed in rather than produced: nothing here is genuinely
+        unserialisable, so this pins the arithmetic and not the cause. What
+        opens a gap in practice is a record the transport cannot encode, and
+        that `sent_indices` skips it is
+        `test_transport.py::test_sent_indices_skip_records_that_could_not_be_encoded`.
+        """
+        transport = FakeTransport(self._rejects_after(1, (0, 2, 3)))
+        client = make_client(transport, batch_size=4, flush_interval=5.0)
+        try:
+            for i in range(4):
+                client.record(
+                    session_id="r{0}".format(i), inputs=[], action={"type": "ok"}
+                )
+            assert client.flush(timeout=3.0)
+        finally:
+            client.close(timeout=0.5)
+
+        # r0 written; r1 never reached the wire; r2 refused; r3 resumed.
+        assert [r["session_id"] for r in transport.attempts[1].records] == ["r3"]
+        stats = client.stats()
+        assert stats["sent"] == 2  # r0 on the first attempt, r3 on the second
+        assert stats["dropped"] == 2  # r1 unserialisable, r2 refused
+
+    def test_a_rejection_that_says_nothing_still_discards_the_batch(self):
+        """No `results` means nothing was written, and the old path applies."""
+        transport = FakeTransport(fail_times(1000, retryable=False, status=400))
+        client = make_client(transport, batch_size=3, flush_interval=5.0)
+        try:
+            for i in range(3):
+                client.record(
+                    session_id="r{0}".format(i), inputs=[], action={"type": "ok"}
+                )
+            deadline = time.time() + 3
+            while client.stats()["dropped"] == 0 and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            client.close(timeout=0.5)
+        assert client.stats()["dropped"] == 3
+        assert client.stats()["sent"] == 0
+
+
 class TestThreadSafety:
     def test_fifty_threads_lose_nothing(self):
         transport = FakeTransport()
@@ -405,7 +547,7 @@ class TestFlushAndStats:
             assert set(client.stats()) == {
                 "queued",
                 "sent",
-                "failed",
+                "failed_batches",
                 "dropped",
                 "last_error",
                 "last_success_at",
@@ -414,12 +556,140 @@ class TestFlushAndStats:
             assert client.flush(timeout=3.0)
             stats = client.stats()
             assert stats["sent"] == 1
-            assert stats["failed"] == 1
+            assert stats["failed_batches"] == 1
             assert stats["dropped"] == 0
             assert stats["queued"] == 0
             assert stats["last_success_at"] is not None
         finally:
             client.close(timeout=0.5)
+
+    def test_an_unserialisable_record_is_dropped_not_counted_as_sent(
+        self, stub_server
+    ):
+        """`sent` must never include a record that stayed in the process.
+
+        The real transport, over a real socket: one encodable record and one
+        that is not, in a single batch. The POST succeeds, so this is the
+        success branch — and the record that never made it into the body has
+        to land in `dropped` rather than be absorbed into `sent`.
+        """
+        client = AverClient(
+            api_key="k",
+            stream_id="s",
+            base_url=stub_server.url,
+            # Large interval, batch of two: the flusher is woken by the second
+            # record, so both are certain to travel together.
+            flush_interval=5.0,
+            batch_size=2,
+        )
+        try:
+            # A first, ordinary record: it takes the once-per-process size
+            # probe, which would otherwise be the thing that trips on a cycle.
+            client.record(
+                session_id="app-1",
+                inputs=[{"role": "form", "data": {"a": 1}}],
+                action={"type": "approve"},
+            )
+            circular = {"a": 1}
+            circular["self"] = circular  # deep-copies fine, never JSON-encodes
+            client.record(
+                session_id="app-2",
+                inputs=[{"role": "form", "data": circular}],
+                action={"type": "approve"},
+            )
+            assert client.flush(timeout=3.0)
+        finally:
+            client.close(timeout=0.5)
+
+        stats = client.stats()
+        assert stats["sent"] == 1, "counted a record that never left the process"
+        assert stats["dropped"] == 1
+        assert len(stub_server.requests[0]["body"]["records"]) == 1
+
+    def test_a_wholly_unserialisable_batch_is_not_a_success(self):
+        """No POST happened, so nothing may look delivered.
+
+        This is the shape the bug took: `send` returned cleanly when it had
+        encoded nothing, the buffer ran its success branch, and every record in
+        the batch became `sent` with a fresh `last_success_at` and `dropped`
+        at zero. The transport now refuses; this pins what the buffer does with
+        that refusal.
+
+        The refusal is handed in, not produced — that the real transport raises
+        it rather than returning cleanly is
+        `test_transport.py::test_batch_of_only_bad_records_sends_nothing`.
+        """
+
+        def nothing_encodable(_n):
+            raise AverTransportError(
+                "no record in the batch could be serialised",
+                retryable=False,
+                kind="UnserialisableBatch",
+            )
+
+        client = make_client(FakeTransport(behaviour=nothing_encodable), batch_size=1)
+        try:
+            client.record(session_id="app-1", inputs=[], action={"type": "approve"})
+            deadline = time.time() + 3
+            while client.stats()["dropped"] == 0 and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            client.close(timeout=0.5)
+
+        stats = client.stats()
+        assert stats["sent"] == 0
+        assert stats["dropped"] == 1
+        assert stats["last_success_at"] is None, "stamped a success with no delivery"
+        assert stats["last_error"] == "UnserialisableBatch"
+
+    def test_a_transport_that_reports_no_count_is_a_bug_not_a_delivery(self):
+        """There is no safe default for a missing count, so none is invented.
+
+        Treating it as "all of them" is the bug the return value was added to
+        fix, arriving by a different door.
+        """
+
+        class SilentTransport(FakeTransport):
+            def send(self, batch):
+                super().send(batch)
+                return None  # the contract says int
+
+        client = make_client(SilentTransport(), batch_size=1)
+        try:
+            client.record(session_id="app-1", inputs=[], action={"type": "approve"})
+            deadline = time.time() + 3
+            while client.stats()["dropped"] == 0 and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            client.close(timeout=0.5)
+
+        stats = client.stats()
+        assert stats["sent"] == 0, "counted as delivered on a transport's word"
+        assert stats["dropped"] == 1
+        assert stats["last_success_at"] is None
+        assert stats["last_error"] == "TypeError"
+
+    def test_zero_delivered_does_not_stamp_a_success(self):
+        """`last_success_at` means a delivery, not that this line was reached."""
+
+        class DeliversNothing(FakeTransport):
+            def send(self, batch):
+                super().send(batch)
+                return 0
+
+        client = make_client(DeliversNothing(), batch_size=1)
+        try:
+            client.record(session_id="app-1", inputs=[], action={"type": "approve"})
+            deadline = time.time() + 3
+            while client.stats()["dropped"] == 0 and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            client.close(timeout=0.5)
+
+        stats = client.stats()
+        assert stats["sent"] == 0
+        assert stats["dropped"] == 1
+        assert stats["last_success_at"] is None
 
     def test_logger_reports_start_flush_retry_and_drop(self, caplog):
         """The four levels the platform team is told to watch."""
@@ -497,7 +767,7 @@ class TestFlushAndStats:
     def test_last_error_never_carries_the_response_body(self):
         """stats() gets exposed on health endpoints; bodies can echo records."""
         echoed = (
-            'invalid record: {"inputs": [{"value": {"employer": "Acme Bank"}}]}'
+            'invalid record: {"inputs": [{"data": {"employer": "Acme Bank"}}]}'
         )
 
         def behaviour(_n):
@@ -526,7 +796,7 @@ class TestFlushAndStats:
             try:
                 client.record(
                     session_id="app-1",
-                    inputs=[{"role": "form", "value": {"pan": "ABCDE1234F"}}],
+                    inputs=[{"role": "form", "data": {"pan": "ABCDE1234F"}}],
                     action={"type": "deny", "reason_code": "SECRET_RULE"},
                 )
                 client.flush(timeout=1.0)

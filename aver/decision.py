@@ -48,7 +48,9 @@ class DecisionRecorder:
 
     def observe(self, role: str, value: Any) -> None:
         """Note something the decision system saw, under the role it played."""
-        self._inputs.append({"role": role, "value": value})
+        # "data" is the wire key the service reads; the parameter keeps the
+        # name that reads best at the call site.
+        self._inputs.append({"role": role, "data": value})
 
     def model(
         self,

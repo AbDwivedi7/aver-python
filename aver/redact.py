@@ -98,10 +98,15 @@ class Redactor:
         """Deep-copy and redact every input in a record."""
         out = []
         for item in inputs:
-            value = self.apply(item.get("value"))
+            # ``data``, with no fallback to the old ``value`` key. There is no
+            # working caller to protect: every record sent under ``value`` went
+            # to a route that answered 404. Keeping a shim would leave two
+            # spellings of the same field in the one library whose selling
+            # point is that a security team can read it in an afternoon.
+            value = self.apply(item.get("data"))
             if not self._probed_size:
                 self._warn_if_large(item.get("role", "?"), value)
-            out.append({"role": item.get("role", "?"), "value": value})
+            out.append({"role": item.get("role", "?"), "data": value})
         self._warn_unmatched()
         return out  # type: ignore[return-value]
 

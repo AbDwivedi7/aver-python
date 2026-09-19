@@ -142,7 +142,7 @@ class TestNoMutation:
                 d.record_action({"type": "approve"})
             form["applicant"]["amount"] = 999999  # caller carries on
             assert client.flush(timeout=2.0)
-            sent = transport.delivered_records()[0]["inputs"][0]["value"]
+            sent = transport.delivered_records()[0]["inputs"][0]["data"]
             assert sent["applicant"]["amount"] == 100
         finally:
             client.close(timeout=0.5)
@@ -170,7 +170,7 @@ class TestNothingLeaksOnTheWire:
             # Structural first: exactly which fields were masked, on every
             # attempt (a retry must not ship an unredacted copy).
             for attempt in attempts:
-                value = attempt.records[0]["inputs"][0]["value"]
+                value = attempt.records[0]["inputs"][0]["data"]
                 assert value["applicant"] == {"pan": MASK, "name": MASK, "age": 34}
                 assert set(value["bureau_report"].values()) == {MASK}
                 assert [a["balance"] for a in value["accounts"]] == [MASK, MASK]
@@ -207,7 +207,7 @@ class TestUnmatchedPathWarning:
                 for _ in range(3):
                     client.record(
                         session_id="app",
-                        inputs=[{"role": "form", "value": bureau_payload()}],
+                        inputs=[{"role": "form", "data": bureau_payload()}],
                         action={"type": "approve"},
                     )
             warnings = [r for r in caplog.records if "matched nothing" in r.message]
@@ -230,7 +230,7 @@ class TestUnmatchedPathWarning:
             with caplog.at_level(logging.WARNING, logger="aver"):
                 client.record(
                     session_id="app",
-                    inputs=[{"role": "form", "value": bureau_payload()}],
+                    inputs=[{"role": "form", "data": bureau_payload()}],
                     action={"type": "approve"},
                 )
             assert "matched nothing" not in caplog.text
@@ -269,7 +269,7 @@ class TestLargeInputProbe:
         small = {"applicant": {"pan": "ABCDE1234F"}}  # nowhere near the limit
         redactor = Redactor(["applicant.pan"])
         for _ in range(5):
-            redactor.redact_inputs([{"role": "form", "value": small}])
+            redactor.redact_inputs([{"role": "form", "data": small}])
 
         assert len(calls) == 1, "measured {0} times, expected 1".format(len(calls))
         assert redactor._probed_size is True
@@ -281,7 +281,7 @@ class TestLargeInputProbe:
         redactor = Redactor([])
         with caplog.at_level(logging.WARNING, logger="aver"):
             for _ in range(3):
-                redactor.redact_inputs([{"role": "cibil", "value": payload}])
+                redactor.redact_inputs([{"role": "cibil", "data": payload}])
         warnings = [r for r in caplog.records if "large inputs slow" in r.message]
         assert len(warnings) == 1
         assert "cibil" in warnings[0].getMessage()
@@ -303,7 +303,7 @@ class TestLargeInputProbe:
         assert (time.perf_counter() - before) < 0.005, "not actually cheap to copy"
 
         with caplog.at_level(logging.WARNING, logger="aver"):
-            Redactor([]).redact_inputs([{"role": "cibil", "value": payload}])
+            Redactor([]).redact_inputs([{"role": "cibil", "data": payload}])
         assert "large inputs slow" in caplog.text
 
 
@@ -317,14 +317,14 @@ class TestMissingRole:
         try:
             result = client.record(
                 session_id="app-1",
-                inputs=[{"value": {"amount": 5}}],  # no "role"
+                inputs=[{"data": {"amount": 5}}],  # no "role"
                 action={"type": "approve"},
             )
             assert result is not None
             assert client.flush(timeout=2.0)
             record = transport.delivered_records()[0]
             assert record["inputs"][0]["role"] == "?"
-            assert record["inputs"][0]["value"] == {"amount": 5}
+            assert record["inputs"][0]["data"] == {"amount": 5}
             assert client.stats()["dropped"] == 0
         finally:
             client.close(timeout=0.5)

@@ -36,7 +36,8 @@ class FakeTransport:
         self.delivered: List[Dict[str, Any]] = []
         self.closed = False
 
-    def send(self, batch) -> None:
+    def send(self, batch) -> int:
+        """Deliver, and report how many records went out — like the real one."""
         snapshot = [copy.deepcopy(dict(r)) for r in batch]
         with self._lock:
             self.attempts.append(Attempt(snapshot))
@@ -45,6 +46,7 @@ class FakeTransport:
             self._behaviour(n)
         with self._lock:
             self.delivered.extend(snapshot)
+        return len(snapshot)
 
     def close(self) -> None:
         self.closed = True
@@ -102,7 +104,15 @@ class _Handler(BaseHTTPRequestHandler):
         server: Any = self.server
         with server.lock:
             server.requests.append(
-                {"headers": dict(self.headers), "body": json.loads(body or b"{}")}
+                {
+                    # The path is part of the contract, so it is captured like
+                    # the body is. Nothing asserted on it until the wire
+                    # contract test existed, and the SDK spent its whole life
+                    # posting to a route the service does not serve.
+                    "path": self.path,
+                    "headers": dict(self.headers),
+                    "body": json.loads(body or b"{}"),
+                }
             )
             status = server.next_status
             payload = json.dumps(server.next_body).encode()

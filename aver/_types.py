@@ -24,10 +24,16 @@ Action = Dict[str, Any]
 
 
 class Input(TypedDict):
-    """One thing the decision system saw, under the role it played."""
+    """One thing the decision system saw, under the role it played.
+
+    ``data`` is the key the service reads. It was ``value`` here until the two
+    sides were first tested against each other, at which point every input was
+    arriving empty and being rejected. There is no fallback: nothing sent under
+    the old key was ever accepted, so there is no working integration to keep.
+    """
 
     role: str
-    value: Any
+    data: Any
 
 
 class Record(TypedDict, total=False):
@@ -37,7 +43,6 @@ class Record(TypedDict, total=False):
     idempotency_key: str
     decision_id: str
     parent_decision_id: Optional[str]
-    stream_id: str
     session_id: str
     inputs: List[Input]
     model_version: Optional[str]
@@ -53,8 +58,14 @@ class Stats(TypedDict):
     """What ``AverClient.stats()`` returns."""
 
     queued: int
+    #: Records that reached the service. Never counts a record the transport
+    #: could not serialise, however the rest of its batch fared.
     sent: int
-    failed: int
+    #: Delivery *attempts* that failed — batches, not records, which is why it
+    #: is not called ``failed``. A batch retried four times adds four.
+    failed_batches: int
+    #: Records lost, for any reason: buffer full, client closed, unbuildable,
+    #: unserialisable, or discarded after a permanent rejection.
     dropped: int
     last_error: Optional[str]
     last_success_at: Optional[str]

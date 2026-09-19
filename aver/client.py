@@ -74,7 +74,9 @@ class AverClient:
         self.stream_id = stream_id
         self.policy_version = policy_version
         self._redactor = Redactor(redact, mode=redact_mode, key=encryption_key)
-        self._transport = transport or Transport(api_key, base_url=base_url)
+        self._transport = transport or Transport(
+            api_key, stream_id, base_url=base_url
+        )
         self._buffer = RecordBuffer(
             self._transport,
             max_records=max_records,
@@ -124,7 +126,8 @@ class AverClient:
                 "idempotency_key": str(uuid.uuid4()),
                 "decision_id": str(uuid.uuid4()),
                 "parent_decision_id": _parent_id(parent_decision_id),
-                "stream_id": self.stream_id,
+                # No stream_id here: it travels once per request, on the
+                # envelope the transport builds. See Transport.send.
                 "session_id": str(session_id),
                 # Redaction happens here, before the record is queued, so the
                 # background thread never holds unredacted values.

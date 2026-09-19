@@ -8,7 +8,7 @@ flusher and logged.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 
 class AverError(Exception):
@@ -55,11 +55,27 @@ class AverTransportError(AverError):
         status_code: Optional[int] = None,
         retry_after: Optional[float] = None,
         kind: Optional[str] = None,
+        written: Optional[int] = None,
+        sent_indices: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
         self.retry_after = retry_after
+        #: How many records the service reports having written before it
+        #: rejected the batch, from ``results`` in the error body. ``None``
+        #: when the body said nothing, in which case nothing was written.
+        #:
+        #: A count, never the body. ``results`` echoes record identifiers back
+        #: and the body itself can quote a record; only the length crosses into
+        #: this object, for the same reason ``summary`` exists.
+        self.written = written
+        #: Positions in the batch that actually reached the wire, in order. A
+        #: record the transport could not serialise is absent, so this is what
+        #: maps ``written`` back onto the caller's batch — without it, one
+        #: unserialisable record shifts the index and the wrong record is
+        #: blamed for the rejection.
+        self.sent_indices = None if sent_indices is None else tuple(sent_indices)
         # `message` may quote the server's response body, which can echo back
         # the record we sent. That belongs in the log, not in stats(), which
         # callers routinely expose on a health endpoint. `summary` is composed

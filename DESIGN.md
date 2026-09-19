@@ -40,6 +40,29 @@ the server, and a retried record lands as a second ledger entry. The key lives
 on the record, from enqueue, and survives rebatching.
 **This requires the server to dedupe on `records[].idempotency_key`.**
 
+**`decision_id` is ours to mint, and the ledger keeps it.** Recording is
+fire-and-forget, so this client cannot learn a server-assigned id without the
+blocking call it promises never to make. While the service minted its own, the
+id `record()` returned named no ledger entry: a caller storing it against the
+loan application had a foreign key to nothing, `reconstruct` answered 404, and
+`parent=` linking was rejected outright — none of it visible until a dispute.
+The service now takes the id on the wire (see its DESIGN.md for the costs it
+accepted). What that buys here is that `record()`'s return value is worth
+storing. What it demands is that the id really is unique: it is `uuid4()`, minted
+once in `client.record`, and a reused one is a permanent 400.
+
+**The wire format is owned by the service, and pinned by a golden fixture.**
+For its whole life this SDK posted to `/v1/records` (the service routes
+`/v1/decisions`), put `stream_id` on each record (the service reads it on the
+envelope) and sent inputs under `value` (the service reads `data`). Three
+mismatches, each fatal alone, and a fully green suite throughout — because
+every test asserted the SDK's shape against itself. `tests/test_wire_contract.py`
+and its golden file are written *from the service's contract*, never
+regenerated from this SDK's output: a golden file produced by the code it
+checks agrees with that code's bugs, which is how all three shipped. The
+envelope, not the record, carries `stream_id`, because the service reads one
+stream per request and scopes the api key to it.
+
 **The deep copy in `Redactor.apply` is unconditional.** It is a snapshot, not
 redaction scaffolding: it is what stops the caller mutating a value after we
 recorded it, since the flusher serialises later on another thread. Do not make
